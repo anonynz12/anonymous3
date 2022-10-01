@@ -1,4 +1,4 @@
-<img src="./pic/Model_Framework.png" alt="Model_Framework" style="zoom:15%;" />
+<img src="./pic/Model_Framework.png" alt="Model_Framework" width="700"/>
 
 ------
 
