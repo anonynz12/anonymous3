@@ -1,9 +1,3 @@
-<p align="center">
-  <img src="./pic/Model_Framework.png" alt="Model_Framework" width="700"/>
-</p>
-
-------
-
 ## CacheGNN: Enhancing Graph Neural Networks with Global Information Caching
 
 This repository contains the PyTorch implementation for our CacheGNN. Further details about CacheGNN can be found in our paper.
@@ -11,6 +5,12 @@ This repository contains the PyTorch implementation for our CacheGNN. Further de
 ## Abstract
 
 Graph neural networks (GNNs) have achieved impressive results on various graph learning tasks. Most GNNs merely leverage information from a limited range of local neighbors, which is difficult to effectively capture global information in the graph. However, utilising global information enables GNNs to capture long-range dependencies and learn more informative node representations. To this end, we propose CacheGNN, an approach that leverages information from global similar nodes to enhance GNNs. Our CacheGNN uses a cache to store node representations and utilises those cached embeddings to efficiently find global similar nodes. To quickly and efficiently making predictions at test time, our CacheGNN retrieves global similar nodes from a set of representative nodes, which is selected from a sparse node selection distribution with Dirichlet prior. We conduct node classification experiments on seven real-world datasets under inductive and transductive settings. Experimental results verify the effectiveness of our CacheGNN.
+
+## Model Framework Overview
+
+<p align="center">
+  <img src="./pic/Model_Framework.png" alt="Model_Framework" width="700"/>
+</p>
 
 ## Requirements
 
