@@ -1,4 +1,6 @@
-<img src="./pic/Model_Framework.png" alt="Model_Framework" width="700"/>
+<p align="center">
+  <img src="./pic/Model_Framework.png" alt="Model_Framework" width="700"/>
+</p>
 
 ------
 
