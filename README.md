@@ -32,7 +32,7 @@ CacheGNN can be equipped with various GNN models, now CacheGNN supports the foll
 - GAT
 - GATv2Conv
 
-In the future, we are committed to enabling CacheGNN to support more GNN models.
+In the future, we aim at enabling CacheGNN to support more GNN models.
 
 ## Data Download
 
