@@ -86,6 +86,9 @@ def get_args():
     parser.add_argument('--dataset',
                         type=str, required=True,
                         help='Which dataset needed to predict')
+    parser.add_argument('--model_path',
+                        type=str, required=True,
+                        help='your_trained_cachegnn_path')
     parser.add_argument('--train_model_path', type=str,
                         required=True, help='Trained CacheGNN model')
     parser.add_argument('--eta', type=float, required=True,
@@ -119,7 +122,6 @@ if __name__ == '__main__':
         train_node_id_dict_path = os.path.join("./data/PPI",
                                                "train_node_id_dict.pkl")
 
-
     model = CacheGNN(
         input_dim=train_dataset.num_features,
         hidden_dim=args.hidden_dim,
@@ -132,5 +134,6 @@ if __name__ == '__main__':
         model_name=args.model,
         criterion=args.criterion).to(device)
 
+    model.load_state_dict(torch.load(args.model_path))
     predicted_micro_f1 = predict(model, test_loader, train_loader, device, non_hop_2_adjacency_matrix_dict)
 
