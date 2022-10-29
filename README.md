@@ -12,14 +12,11 @@ Graph neural networks (GNNs) have achieved impressive results on various graph l
   <img src="./pic/Model_Framework.png" alt="Model_Framework" width="700"/>
 </p>
 
-## Requirements
+## Installation
 
-- Python 3.6
-
-- PyTorch 1.10.1
-- Scikit-Learn 1.12
-- Scipy 1.5.2
-- PyTorch_Geometric 2.1.0
+```shell
+pip install -r requirements.txt
+```
 
 ## Implement Details
 
