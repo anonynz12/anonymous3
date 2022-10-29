@@ -8,7 +8,7 @@ import sys
 
 import torch
 import time
-from utils import construct_matrix, convert_to_one_hot_label, CitationDataset
+from utils import convert_to_one_hot_label, CitationDataset
 from sklearn import metrics
 from torch.optim import Adam
 from torch_geometric.datasets import PPI
