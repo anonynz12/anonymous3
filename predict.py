@@ -6,6 +6,9 @@ import torch
 from sklearn import metrics
 import numpy as np
 from model import CacheGNN
+import os
+from torch_geometric.datasets import PPI
+from torch_geometric.data import DataLoader
 
 random_seed = 1024
 torch.manual_seed(random_seed)
@@ -13,9 +16,10 @@ torch.cuda.manual_seed(random_seed)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 np.random.seed(random_seed)
+import pickle
 
 
-def predict(model, test_loader, train_loader, device, non_hop_2_adjacency_matrix_dict=None):
+def predict(model, test_loader, train_loader, device, non_hop_2_adjacency_matrix_dict):
     model.eval()
 
     with torch.no_grad():
@@ -35,7 +39,7 @@ def predict(model, test_loader, train_loader, device, non_hop_2_adjacency_matrix
         training_embedding = torch.concat(training_embedding)
         training_label = torch.cat(training_label)
 
-    _train_lambda = model.lmabda_
+    _train_lambda = model.lambda_
     prob = _train_lambda / _train_lambda.sum()
     res = []
     sorted_prob, indices = torch.sort(prob, descending=True)
@@ -49,19 +53,19 @@ def predict(model, test_loader, train_loader, device, non_hop_2_adjacency_matrix
 
     _optimized_training_embedding = torch.index_select(training_embedding, 0,
                                                        torch.tensor(res).to(
-                                                           _device))
+                                                           device))
     _optimized_training_label = torch.index_select(training_label, 0,
                                                    torch.tensor(res).to(
-                                                       _device))
+                                                       device))
 
     ys, preds = [], []
 
     for test_data in test_loader:
-        test_data = test_data.to(_device)
+        test_data = test_data.to(device)
         y = test_data.y
         ys.append(y)
         with torch.no_grad():
-            output = model.inference(test_data,
+            output = model.embedding_encoder.inference(test_data,
                                      _optimized_training_embedding,
                                      _optimized_training_label)
             preds.append((output > 0.5).float().cpu())
@@ -73,7 +77,7 @@ def predict(model, test_loader, train_loader, device, non_hop_2_adjacency_matrix
 
 def get_args():
 
-    parser = argparse.ArgumentParse()
+    parser = argparse.ArgumentParser()
     parser.add_argument('--cuda', action='store_true',
                         default=True, help='Use CUDA or not')
     parser.add_argument('--cuda_id', type=int, required=True,
@@ -89,8 +93,6 @@ def get_args():
     parser.add_argument('--model_path',
                         type=str, required=True,
                         help='your_trained_cachegnn_path')
-    parser.add_argument('--train_model_path', type=str,
-                        required=True, help='Trained CacheGNN model')
     parser.add_argument('--eta', type=float, required=True,
                         help='Trade-off parameters')
     parser.add_argument('--k', type=int, required=True,
@@ -98,7 +100,7 @@ def get_args():
     parser.add_argument('--criterion', type=str, required=True,
                         help='softmax or sigmoid')
 
-    return parser.parser_args()
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
@@ -110,17 +112,26 @@ if __name__ == '__main__':
                                                and args.cuda else 'cpu')
 
     if args.dataset == 'ppi':
-        train_dataset = PPI("./data/PPI", split='test')
+        train_dataset = PPI("./data/PPI", split='train')
         test_dataset = PPI("./data/PPI", split='test')
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
         test_loader = DataLoader(test_dataset,
                                  batch_size=2,
                                  shuffle=False)
 
-        non_hop_2_adjacency_matrix_dict_path = os.path.join(
+        non_hop_adjacency_matrix_dict_path = os.path.join(
             "./data/PPI/non_hop_2_adjacency_matrix_dict_val_batch_size_2.pkl")
+
         train_node_id_dict_path = os.path.join("./data/PPI",
                                                "train_node_id_dict.pkl")
+
+        with open(non_hop_adjacency_matrix_dict_path, 'rb') as f:
+            non_hop_adjacency_matrix_dict = pickle.load(f)
+
+        with open(train_node_id_dict_path, 'rb') as f:
+            id_dict = pickle.load(f)
+
+        num_nodes = sum(id_dict.keys())
 
     model = CacheGNN(
         input_dim=train_dataset.num_features,
@@ -135,5 +146,5 @@ if __name__ == '__main__':
         criterion=args.criterion).to(device)
 
     model.load_state_dict(torch.load(args.model_path))
-    predicted_micro_f1 = predict(model, test_loader, train_loader, device, non_hop_2_adjacency_matrix_dict)
-
+    predicted_micro_f1 = predict(model, test_loader, train_loader, device, non_hop_adjacency_matrix_dict)
+    print("micro_f1= {:.2f}".format(predicted_micro_f1))

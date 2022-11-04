@@ -11,8 +11,14 @@ from utils import convert_to_one_hot_label, sim_matrix
 import math
 from tqdm import tqdm
 
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch_geometric.nn import SAGEConv, GATConv, GCNConv, SGConv, GCN2Conv, GATv2Conv
+from utils import convert_to_one_hot_label, sim_matrix
 
-class GraphSAGE_Encoder(nn.Module):
+
+class GraphSAGE_Encoder_SubGraph(nn.Module):
 
     def __init__(self,
                  input_dim,
@@ -23,7 +29,6 @@ class GraphSAGE_Encoder(nn.Module):
                  eta,
                  device):
         super().__init__()
-        self.layers = torch.nn.ModuleList()
         self.layer_1 = SAGEConv(input_dim, hidden_dim)
         self.layer_2 = SAGEConv(hidden_dim, num_classes)
         self.criterion = criterion
@@ -39,11 +44,10 @@ class GraphSAGE_Encoder(nn.Module):
     def pretrain_with_batch(self, data):
 
         x, edge_index = data.x, data.edge_index
-        x = self.layer_1(x, edge_index)
-        x = x.relu_()
-        x = F.dropout(x, p=0.5, training=self.training)
-        lc_x = self.layer_2(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
+        x = F.elu(self.layer_1(x, edge_index))
+        # x = x.relu_()
+        # x = F.dropout(x, p=0.5, training=self.training)
+        lc_x = F.elu(self.layer_2(x, edge_index))
         p_lc = self.m(lc_x)
 
         return p_lc
@@ -53,10 +57,11 @@ class GraphSAGE_Encoder(nn.Module):
         dic = {}
         dic['full_data'] = data
         x, edge_index = data.x, data.edge_index
-        y = data.y[:data.batch_size]
-        x = self.layer_1(x, edge_index)
-        x = x.relu_()
-        embedding = x[:data.batch_size]
+        y = data.y
+
+        x = F.elu(self.layer_1(x, edge_index))
+        # x = x.relu_()
+        embedding = x
 
         dic['train_embedding'] = embedding
         dic['train_label'] = y
@@ -66,45 +71,50 @@ class GraphSAGE_Encoder(nn.Module):
     @torch.no_grad()
     def decode_z_q(self, train_info):
 
+        # print(train_info)
+
         data = train_info['full_data']
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
-        x = self.layer_1(x, edge_index)
-        x = x.relu_()
-        x = F.dropout(x, p=0.5, training=self.training)
+        y = data.y
 
-        lc_x = self.layer_2(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
+        x = F.elu(self.layer_1(x, edge_index))
+        # x = x.relu_()
+        # x = F.dropout(x, p=0.5, training=self.training)
+        lc_x = F.elu(self.layer_2(x, edge_index))
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(train_info['z_q'],
                                                               train_info['z_q'],
                                                               y,
+                                                              train_info['mask'],
                                                               train_info['neighbors_info']))
+        # print(p_sim)
+
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
         return final_label_distribution
 
     def forward(self,
                 data,
+                mask,
                 neighbors_info=None):
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
-        x = self.layer_1(x, edge_index)
-        # x = F.elu(x)
-        x = x.relu_()
-        x = F.dropout(x, p=0.5, training=self.training)
-        embedding = x[:data.batch_size]
+        y = data.y
 
-        lc_x = self.layer_2(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
+        x = F.elu(self.layer_1(x, edge_index))
+        # x = x.relu_()
+        # x = F.dropout(x, p=0.5, training=self.training)
+        embedding = x
+
+        lc_x = F.elu(self.layer_2(x, edge_index))
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
                                                               embedding,
                                                               y,
+                                                              mask,
                                                               neighbors_info))
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
@@ -114,14 +124,16 @@ class GraphSAGE_Encoder(nn.Module):
                                           embedding_a,
                                           embedding_b,
                                           b_y,
+                                          mask,
                                           neighbors_info=None):
-        if self.training:
-            mask = torch.ones(b_y.shape[0], b_y.shape[0])
-            torch.diagonal(mask, 0).zero_()
+
         with torch.no_grad():
             if torch.is_tensor(neighbors_info):
+                # print(neighbors_info)
+                # print("|> [generate_label_with_similar_nodes] Using neighbors information")
                 feature_similarity_matrix = neighbors_info
             else:
+                # print("|> [generate_label_with_similar_nodes] Not Using neighbors information")
                 feature_similarity_matrix = sim_matrix(embedding_a, embedding_b)
             feature_similarity_matrix = feature_similarity_matrix.cpu()
             if self.training:
@@ -150,46 +162,30 @@ class GraphSAGE_Encoder(nn.Module):
 
         return total_fuse_distribution
 
-    def inference(self, x_all, subgraph_loader, training_embedding, training_y, stats_flag):
-        pbar = tqdm(total=len(subgraph_loader.dataset) * len(self.layers))
-        pbar.set_description(stats_flag)
+    def inference(self,
+                  test_data,
+                  training_embedding,
+                  training_y):
 
-        xs = []
-        p_sim_list = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = self.layer_1(x, batch.edge_index)
-            x = x.relu_()
-            embedding = x[:batch.batch_size]
-            y = batch.y[:batch.batch_size]
-            p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
-                                                                  training_embedding,
-                                                                  training_y,
-                                                                  None))
-            p_sim_list.append(p_sim)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
-        p_sim_total = torch.cat(p_sim_list, dim=0)
+        x, edge_index = test_data.x, test_data.edge_index
 
-        xs = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = self.layer_2(x, batch.edge_index)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
+        x = F.elu(self.layer_1(x, edge_index))
+        # x = x.relu_()
+        _data_embedding = x
+        lc_x = F.elu(self.layer_2(x, edge_index))
+        p_lc = self.m(lc_x)
 
-        p_lc_total = self.m(x_all)
-        final_label_distribution = self.eta * p_lc_total.to(self.device) + (1 - self.eta) * p_sim_total
-        pbar.close()
-
+        p_sim = self.m(
+            self.generate_label_with_similar_nodes(_data_embedding,
+                                                   training_embedding,
+                                                   training_y,
+                                                   mask=None,
+                                                   neighbors_info=None))
+        final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
         return final_label_distribution
 
 
-class GAT_Encoder(nn.Module):
+class GAT_Encoder_SubGraph(nn.Module):
 
     def __init__(self,
                  input_dim,
@@ -200,14 +196,9 @@ class GAT_Encoder(nn.Module):
                  eta,
                  device):
         super().__init__()
-
-        self.layers = torch.nn.ModuleList()
         self.layer_1 = GATConv(input_dim, out_channels=hidden_dim, heads=4)
         self.layer_2 = GATConv(4 * hidden_dim, hidden_dim, heads=4)
         self.layer_3 = GATConv(4 * hidden_dim, num_classes, heads=6, concat=False)
-        self.layers.append(self.layer_1)
-        self.layers.append(self.layer_2)
-        self.layers.append(self.layer_3)
 
         self.criterion = criterion
         self.k = k
@@ -220,12 +211,18 @@ class GAT_Encoder(nn.Module):
         self.device = device
 
     def pretrain_with_batch(self, data):
-
+        """
+        预训练环节
+        :param data:
+        :return:
+        """
         x, edge_index = data.x, data.edge_index
+        # print(self.layer_1(x, edge_index))
+
         x = F.elu(self.layer_1(x, edge_index))
         x = F.elu(self.layer_2(x, edge_index))
         lc_x = self.layer_3(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
+
         p_lc = self.m(lc_x)
 
         return p_lc
@@ -235,10 +232,11 @@ class GAT_Encoder(nn.Module):
         dic = {}
         dic['full_data'] = data
         x, edge_index = data.x, data.edge_index
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = F.elu(self.layer_1(x, edge_index))
         x = F.elu(self.layer_2(x, edge_index))
-        embedding = x[:data.batch_size]
+        embedding = x
 
         dic['train_embedding'] = embedding
         dic['train_label'] = y
@@ -251,38 +249,44 @@ class GAT_Encoder(nn.Module):
         data = train_info['full_data']
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = F.elu(self.layer_1(x, edge_index))
         x = F.elu(self.layer_2(x, edge_index))
+
         lc_x = self.layer_3(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(train_info['z_q'],
                                                               train_info['z_q'],
                                                               y,
+                                                              train_info['mask'],
                                                               train_info['neighbors_info']))
+        # print(p_sim)
+
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
         return final_label_distribution
 
     def forward(self,
                 data,
+                mask,
                 neighbors_info=None):
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = F.elu(self.layer_1(x, edge_index))
         x = F.elu(self.layer_2(x, edge_index))
-        embedding = x[:data.batch_size]
+        embedding = x
 
         lc_x = self.layer_3(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
                                                               embedding,
                                                               y,
+                                                              mask,
                                                               neighbors_info))
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
@@ -292,10 +296,9 @@ class GAT_Encoder(nn.Module):
                                           embedding_a,
                                           embedding_b,
                                           b_y,
+                                          mask,
                                           neighbors_info=None):
-        if self.training:
-            mask = torch.ones(b_y.shape[0], b_y.shape[0])
-            torch.diagonal(mask, 0).zero_()
+
         with torch.no_grad():
             if torch.is_tensor(neighbors_info):
                 feature_similarity_matrix = neighbors_info
@@ -328,53 +331,31 @@ class GAT_Encoder(nn.Module):
 
         return total_fuse_distribution
 
-    def inference(self, x_all, subgraph_loader, training_embedding, training_y, stats_flag):
-        pbar = tqdm(total=len(subgraph_loader.dataset) * len(self.layers))
-        pbar.set_description(stats_flag)
+    def inference(self,
+                  test_data,
+                  training_embedding,
+                  training_y):
 
-        xs = []
-        p_sim_list = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = F.elu(self.layer_1(x, batch.edge_index))
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
+        x, edge_index = test_data.x, test_data.edge_index
 
-        xs = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = F.elu(self.layer_2(x, batch.edge_index))
-            embedding = x[:batch.batch_size]
-            p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
-                                                                  training_embedding,
-                                                                  training_y,
-                                                                  None))
-            p_sim_list.append(p_sim)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
-        p_sim_total = torch.cat(p_sim_list, dim=0)
+        x = F.elu(self.layer_1(x, edge_index))
+        x = F.elu(self.layer_2(x, edge_index))
+        _data_embedding = x
+        lc_x = self.layer_3(x, edge_index)
+        p_lc = self.m(lc_x)
 
-        xs = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = self.layer_3(x, batch.edge_index)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
 
-        p_lc_total = self.m(x_all)
-        final_label_distribution = self.eta * p_lc_total.to(self.device) + (1 - self.eta) * p_sim_total
-        pbar.close()
-
+        p_sim = self.m(
+            self.generate_label_with_similar_nodes(_data_embedding,
+                                                   training_embedding,
+                                                   training_y,
+                                                   mask=None,
+                                                   neighbors_info=None))
+        final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
         return final_label_distribution
 
 
-class GATv2Conv_Encoder(nn.Module):
+class GATv2Conv_Encoder_SubGraph(nn.Module):
 
     def __init__(self,
                  input_dim,
@@ -385,14 +366,9 @@ class GATv2Conv_Encoder(nn.Module):
                  eta,
                  device):
         super().__init__()
-
-        self.layers = torch.nn.ModuleList()
         self.layer_1 = GATv2Conv(input_dim, out_channels=hidden_dim, heads=4)
         self.layer_2 = GATv2Conv(4 * hidden_dim, hidden_dim, heads=4)
         self.layer_3 = GATv2Conv(4 * hidden_dim, num_classes, heads=6, concat=False)
-        self.layers.append(self.layer_1)
-        self.layers.append(self.layer_2)
-        self.layers.append(self.layer_3)
 
         self.criterion = criterion
         self.k = k
@@ -405,12 +381,18 @@ class GATv2Conv_Encoder(nn.Module):
         self.device = device
 
     def pretrain_with_batch(self, data):
-
+        """
+        预训练环节
+        :param data:
+        :return:
+        """
         x, edge_index = data.x, data.edge_index
+        # print(self.layer_1(x, edge_index))
+
         x = F.elu(self.layer_1(x, edge_index))
         x = F.elu(self.layer_2(x, edge_index))
         lc_x = self.layer_3(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
+
         p_lc = self.m(lc_x)
 
         return p_lc
@@ -420,10 +402,11 @@ class GATv2Conv_Encoder(nn.Module):
         dic = {}
         dic['full_data'] = data
         x, edge_index = data.x, data.edge_index
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = F.elu(self.layer_1(x, edge_index))
         x = F.elu(self.layer_2(x, edge_index))
-        embedding = x[:data.batch_size]
+        embedding = x
 
         dic['train_embedding'] = embedding
         dic['train_label'] = y
@@ -436,38 +419,44 @@ class GATv2Conv_Encoder(nn.Module):
         data = train_info['full_data']
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = F.elu(self.layer_1(x, edge_index))
         x = F.elu(self.layer_2(x, edge_index))
+
         lc_x = self.layer_3(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(train_info['z_q'],
                                                               train_info['z_q'],
                                                               y,
+                                                              train_info['mask'],
                                                               train_info['neighbors_info']))
+        # print(p_sim)
+
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
         return final_label_distribution
 
     def forward(self,
                 data,
+                mask,
                 neighbors_info=None):
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = F.elu(self.layer_1(x, edge_index))
         x = F.elu(self.layer_2(x, edge_index))
-        embedding = x[:data.batch_size]
+        embedding = x
 
         lc_x = self.layer_3(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
                                                               embedding,
                                                               y,
+                                                              mask,
                                                               neighbors_info))
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
@@ -477,10 +466,9 @@ class GATv2Conv_Encoder(nn.Module):
                                           embedding_a,
                                           embedding_b,
                                           b_y,
+                                          mask,
                                           neighbors_info=None):
-        if self.training:
-            mask = torch.ones(b_y.shape[0], b_y.shape[0])
-            torch.diagonal(mask, 0).zero_()
+
         with torch.no_grad():
             if torch.is_tensor(neighbors_info):
                 feature_similarity_matrix = neighbors_info
@@ -513,53 +501,31 @@ class GATv2Conv_Encoder(nn.Module):
 
         return total_fuse_distribution
 
-    def inference(self, x_all, subgraph_loader, training_embedding, training_y, stats_flag):
-        pbar = tqdm(total=len(subgraph_loader.dataset) * len(self.layers))
-        pbar.set_description(stats_flag)
+    def inference(self,
+                  test_data,
+                  training_embedding,
+                  training_y):
 
-        xs = []
-        p_sim_list = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = F.elu(self.layer_1(x, batch.edge_index))
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
+        x, edge_index = test_data.x, test_data.edge_index
 
-        xs = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = F.elu(self.layer_2(x, batch.edge_index))
-            embedding = x[:batch.batch_size]
-            p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
-                                                                  training_embedding,
-                                                                  training_y,
-                                                                  None))
-            p_sim_list.append(p_sim)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
-        p_sim_total = torch.cat(p_sim_list, dim=0)
+        x = F.elu(self.layer_1(x, edge_index))
+        x = F.elu(self.layer_2(x, edge_index))
+        _data_embedding = x
+        lc_x = self.layer_3(x, edge_index)
+        p_lc = self.m(lc_x)
 
-        xs = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = self.layer_3(x, batch.edge_index)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
 
-        p_lc_total = self.m(x_all)
-        final_label_distribution = self.eta * p_lc_total.to(self.device) + (1 - self.eta) * p_sim_total
-        pbar.close()
-
+        p_sim = self.m(
+            self.generate_label_with_similar_nodes(_data_embedding,
+                                                   training_embedding,
+                                                   training_y,
+                                                   mask=None,
+                                                   neighbors_info=None))
+        final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
         return final_label_distribution
 
 
-class GCN_Encoder(nn.Module):
+class GCN_Encoder_SubGraph(nn.Module):
 
     def __init__(self,
                  input_dim,
@@ -570,12 +536,8 @@ class GCN_Encoder(nn.Module):
                  eta,
                  device):
         super().__init__()
-
-        self.layers = torch.nn.ModuleList()
         self.layer_1 = GCNConv(input_dim, hidden_dim)
         self.layer_2 = GCNConv(hidden_dim, num_classes)
-        self.layers.append(self.layer_1)
-        self.layers.append(self.layer_2)
 
         self.criterion = criterion
         self.k = k
@@ -588,14 +550,17 @@ class GCN_Encoder(nn.Module):
         self.device = device
 
     def pretrain_with_batch(self, data):
-
+        """
+        预训练环节
+        :param data:
+        :return:
+        """
         x, edge_index = data.x, data.edge_index
 
         x = self.layer_1(x, edge_index)
         x = F.relu(x)
         lc_x = self.layer_2(x, edge_index)
 
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         return p_lc
@@ -605,10 +570,11 @@ class GCN_Encoder(nn.Module):
         dic = {}
         dic['full_data'] = data
         x, edge_index = data.x, data.edge_index
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = self.layer_1(x, edge_index)
         x = F.relu(x)
-        embedding = x[:data.batch_size]
+        embedding = x
 
         dic['train_embedding'] = embedding
         dic['train_label'] = y
@@ -621,37 +587,44 @@ class GCN_Encoder(nn.Module):
         data = train_info['full_data']
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = self.layer_1(x, edge_index)
         x = F.relu(x)
+
         lc_x = self.layer_2(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(train_info['z_q'],
                                                               train_info['z_q'],
                                                               y,
+                                                              train_info['mask'],
                                                               train_info['neighbors_info']))
+        # print(p_sim)
+
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
         return final_label_distribution
 
     def forward(self,
                 data,
+                mask,
                 neighbors_info=None):
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = self.layer_1(x, edge_index)
         x = F.relu(x)
-        embedding = x[:data.batch_size]
+        embedding = x
+
         lc_x = self.layer_2(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
                                                               embedding,
                                                               y,
+                                                              mask,
                                                               neighbors_info))
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
@@ -661,10 +634,9 @@ class GCN_Encoder(nn.Module):
                                           embedding_a,
                                           embedding_b,
                                           b_y,
+                                          mask,
                                           neighbors_info=None):
-        if self.training:
-            mask = torch.ones(b_y.shape[0], b_y.shape[0])
-            torch.diagonal(mask, 0).zero_()
+
         with torch.no_grad():
             if torch.is_tensor(neighbors_info):
                 feature_similarity_matrix = neighbors_info
@@ -697,45 +669,31 @@ class GCN_Encoder(nn.Module):
 
         return total_fuse_distribution
 
-    def inference(self, x_all, subgraph_loader, training_embedding, training_y, stats_flag):
-        pbar = tqdm(total=len(subgraph_loader.dataset) * len(self.layers))
-        pbar.set_description(stats_flag)
+    def inference(self,
+                  test_data,
+                  training_embedding,
+                  training_y):
 
-        xs = []
-        p_sim_list = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = self.layer_1(x, batch.edge_index)
-            x = F.relu(x)
-            embedding = x[:batch.batch_size]
-            p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
-                                                                  training_embedding,
-                                                                  training_y,
-                                                                  None))
-            p_sim_list.append(p_sim)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
-        p_sim_total = torch.cat(p_sim_list, dim=0)
+        x, edge_index = test_data.x, test_data.edge_index
 
-        xs = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = self.layer_2(x, batch.edge_index)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
+        x = self.layer_1(x, edge_index)
+        x = F.relu(x)
+        _data_embedding = x
+        lc_x = self.layer_2(x, edge_index)
+        p_lc = self.m(lc_x)
 
-        p_lc_total = self.m(x_all)
-        final_label_distribution = self.eta * p_lc_total.to(self.device) + (1 - self.eta) * p_sim_total
-        pbar.close()
 
+        p_sim = self.m(
+            self.generate_label_with_similar_nodes(_data_embedding,
+                                                   training_embedding,
+                                                   training_y,
+                                                   mask=None,
+                                                   neighbors_info=None))
+        final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
         return final_label_distribution
 
 
-class SGC_Encoder(nn.Module):
+class SGC_Encoder_SubGraph(nn.Module):
 
     def __init__(self,
                  input_dim,
@@ -746,13 +704,8 @@ class SGC_Encoder(nn.Module):
                  eta,
                  device):
         super().__init__()
-
-        self.layers = torch.nn.ModuleList()
-        self.layers = torch.nn.ModuleList()
         self.layer_1 = SGConv(input_dim, hidden_dim, K=2)
         self.layer_2 = SGConv(hidden_dim, num_classes, K=2)
-        self.layers.append(self.layer_1)
-        self.layers.append(self.layer_2)
 
         self.criterion = criterion
         self.k = k
@@ -765,13 +718,16 @@ class SGC_Encoder(nn.Module):
         self.device = device
 
     def pretrain_with_batch(self, data):
-
+        """
+        预训练环节
+        :param data:
+        :return:
+        """
         x, edge_index = data.x, data.edge_index
 
         x = self.layer_1(x, edge_index)
         lc_x = self.layer_2(x, edge_index)
 
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         return p_lc
@@ -781,9 +737,10 @@ class SGC_Encoder(nn.Module):
         dic = {}
         dic['full_data'] = data
         x, edge_index = data.x, data.edge_index
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = self.layer_1(x, edge_index)
-        embedding = x[:data.batch_size]
+        embedding = x
 
         dic['train_embedding'] = embedding
         dic['train_label'] = y
@@ -796,35 +753,42 @@ class SGC_Encoder(nn.Module):
         data = train_info['full_data']
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = self.layer_1(x, edge_index)
+
         lc_x = self.layer_2(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(train_info['z_q'],
                                                               train_info['z_q'],
                                                               y,
+                                                              train_info['mask'],
                                                               train_info['neighbors_info']))
+        # print(p_sim)
+
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
         return final_label_distribution
 
     def forward(self,
                 data,
+                mask,
                 neighbors_info=None):
         x, edge_index = data.x, data.edge_index
 
-        y = data.y[:data.batch_size]
+        y = data.y
+
         x = self.layer_1(x, edge_index)
-        embedding = x[:data.batch_size]
+        embedding = x
+
         lc_x = self.layer_2(x, edge_index)
-        lc_x = lc_x[:data.batch_size]
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
                                                               embedding,
                                                               y,
+                                                              mask,
                                                               neighbors_info))
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
@@ -834,10 +798,9 @@ class SGC_Encoder(nn.Module):
                                           embedding_a,
                                           embedding_b,
                                           b_y,
+                                          mask,
                                           neighbors_info=None):
-        if self.training:
-            mask = torch.ones(b_y.shape[0], b_y.shape[0])
-            torch.diagonal(mask, 0).zero_()
+
         with torch.no_grad():
             if torch.is_tensor(neighbors_info):
                 feature_similarity_matrix = neighbors_info
@@ -870,44 +833,30 @@ class SGC_Encoder(nn.Module):
 
         return total_fuse_distribution
 
-    def inference(self, x_all, subgraph_loader, training_embedding, training_y, stats_flag):
-        pbar = tqdm(total=len(subgraph_loader.dataset) * len(self.layers))
-        pbar.set_description(stats_flag)
+    def inference(self,
+                  test_data,
+                  training_embedding,
+                  training_y):
 
-        xs = []
-        p_sim_list = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = self.layer_1(x, batch.edge_index)
-            embedding = x[:batch.batch_size]
-            p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
-                                                                  training_embedding,
-                                                                  training_y,
-                                                                  None))
-            p_sim_list.append(p_sim)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
-        p_sim_total = torch.cat(p_sim_list, dim=0)
+        x, edge_index = test_data.x, test_data.edge_index
 
-        xs = []
-        for batch in subgraph_loader:
-            batch = batch.to(self.device)
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = self.layer_2(x, batch.edge_index)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
+        x = self.layer_1(x, edge_index)
+        _data_embedding = x
+        lc_x = self.layer_2(x, edge_index)
+        p_lc = self.m(lc_x)
 
-        p_lc_total = self.m(x_all)
-        final_label_distribution = self.eta * p_lc_total.to(self.device) + (1 - self.eta) * p_sim_total
-        pbar.close()
 
+        p_sim = self.m(
+            self.generate_label_with_similar_nodes(_data_embedding,
+                                                   training_embedding,
+                                                   training_y,
+                                                   mask=None,
+                                                   neighbors_info=None))
+        final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
         return final_label_distribution
 
 
-class GCNII_Encoder(nn.Module):
+class GCNII_Encoder_SubGraph(nn.Module):
 
     def __init__(self,
                  input_dim,
@@ -917,18 +866,17 @@ class GCNII_Encoder(nn.Module):
                  k,
                  eta,
                  device,
+                 n_layers=9,
                  alpha=0.5,
                  theta=1.0,
-                 n_layers=9,
                  shared_weights=False,
-                 dropout=0.2):
+                 dropout=0.5):
         super().__init__()
 
-        self.lins = torch.nn.ModuleList()
-        self.lins.append(torch.nn.Linear(input_dim, hidden_dim))
-        self.lins.append(torch.nn.Linear(hidden_dim, num_classes))
-
-        self.convs = torch.nn.ModuleList()
+        self.lins = nn.ModuleList()
+        self.lins.append(nn.Linear(input_dim, hidden_dim))
+        self.lins.append(nn.Linear(hidden_dim, num_classes))
+        self.convs = nn.ModuleList()
         for layer in range(n_layers):
             self.convs.append(
                 GCN2Conv(hidden_dim, alpha, theta,
@@ -946,20 +894,24 @@ class GCNII_Encoder(nn.Module):
         self.device = device
 
     def pretrain_with_batch(self, data):
-
+        """
+        预训练环节
+        :param data:
+        :return:
+        """
         x, adj_t = data.x, data.adj_t
         x = F.dropout(x, self.dropout, training=self.training)
         x = x_0 = self.lins[0](x).relu()
 
-        for i, conv in enumerate(self.convs):
+        for conv in self.convs:
             h = F.dropout(x, self.dropout, training=self.training)
             h = conv(h, x_0, adj_t)
-            x = x + h
+            x = h + x
             x = x.relu()
 
-        x = F.dropout(x, self.dropout, training=self.training)
+        x = F.dropout(x, self.dropout, training=self.training)  # Embedding
         lc_x = self.lins[1](x)
-        lc_x = lc_x[:data.batch_size]
+
         p_lc = self.m(lc_x)
 
         return p_lc
@@ -970,17 +922,17 @@ class GCNII_Encoder(nn.Module):
         dic['full_data'] = data
 
         x, adj_t = data.x, data.adj_t
-        x = F.dropout(x, self.dropout, training=False)
+        x = F.dropout(x, self.dropout, training=self.training)
         x = x_0 = self.lins[0](x).relu()
-        y = data.y[:data.batch_size]
+        y = data.y
 
-        for i, conv in enumerate(self.convs):
+        for conv in self.convs:
             h = F.dropout(x, self.dropout, training=False)
             h = conv(h, x_0, adj_t)
-            x = x + h
+            x = h + x
             x = x.relu()
 
-        embedding = x[:data.batch_size]
+        embedding = x
 
         dic['train_embedding'] = embedding
         dic['train_label'] = y
@@ -991,55 +943,59 @@ class GCNII_Encoder(nn.Module):
     def decode_z_q(self, train_info):
 
         data = train_info['full_data']
-
         x, adj_t = data.x, data.adj_t
         x = F.dropout(x, self.dropout, training=self.training)
         x = x_0 = self.lins[0](x).relu()
-        y = data.y[:data.batch_size]
+        y = data.y
 
-        for i, conv in enumerate(self.convs):
+        for conv in self.convs:
             h = F.dropout(x, self.dropout, training=self.training)
             h = conv(h, x_0, adj_t)
-            x = x + h
+            x = h + x
             x = x.relu()
 
-        x = F.dropout(x, self.dropout, training=self.training)
+        x = F.dropout(x, self.dropout, training=self.training)  # Embedding
         lc_x = self.lins[1](x)
-        lc_x = lc_x[:data.batch_size]
+
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(train_info['z_q'],
                                                               train_info['z_q'],
                                                               y,
+                                                              train_info['mask'],
                                                               train_info['neighbors_info']))
+        # print(p_sim)
+
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
         return final_label_distribution
 
     def forward(self,
                 data,
+                mask,
                 neighbors_info=None):
+
+        y = data.y
+
         x, adj_t = data.x, data.adj_t
         x = F.dropout(x, self.dropout, training=self.training)
         x = x_0 = self.lins[0](x).relu()
-        y = data.y[:data.batch_size]
-
-        for i, conv in enumerate(self.convs):
+        for conv in self.convs:
             h = F.dropout(x, self.dropout, training=self.training)
             h = conv(h, x_0, adj_t)
-            x = x + h
+            x = h + x
             x = x.relu()
 
-        embedding = x[:data.batch_size]
-
-        x = F.dropout(x, self.dropout, training=self.training)
+        x = F.dropout(x, self.dropout, training=self.training)  # Embedding
+        embedding = x
         lc_x = self.lins[1](x)
-        lc_x = lc_x[:data.batch_size]
+
         p_lc = self.m(lc_x)
 
         p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
                                                               embedding,
                                                               y,
+                                                              mask,
                                                               neighbors_info))
         final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
@@ -1049,10 +1005,9 @@ class GCNII_Encoder(nn.Module):
                                           embedding_a,
                                           embedding_b,
                                           b_y,
+                                          mask,
                                           neighbors_info=None):
-        if self.training:
-            mask = torch.ones(b_y.shape[0], b_y.shape[0])
-            torch.diagonal(mask, 0).zero_()
+
         with torch.no_grad():
             if torch.is_tensor(neighbors_info):
                 feature_similarity_matrix = neighbors_info
@@ -1085,56 +1040,36 @@ class GCNII_Encoder(nn.Module):
 
         return total_fuse_distribution
 
-    def inference(self, x_all, subgraph_loader, training_embedding, training_y, stats_flag):
-        pbar = tqdm(total=len(subgraph_loader.dataset) * (len(self.convs) + len(self.lins)))
-        pbar.set_description(stats_flag)
+    def inference(self,
+                  test_data,
+                  training_embedding,
+                  training_y):
 
-        xs = []
-        for batch in subgraph_loader:
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            x = self.lins[0](x).relu()
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = x_all_first = torch.cat(xs, dim=0)
+        x, adj_t = test_data.x, test_data.adj_t
+        x = F.dropout(x, self.dropout, training=False)
+        x = x_0 = self.lins[0](x).relu()
 
-        for i, conv in enumerate(self.convs):
-            xs = []
-            for batch in subgraph_loader:
-                x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-                x_0 = x_all_first[batch.n_id.to(x_all.device)].to(self.device)
-                h = F.dropout(x, self.dropout, training=self.training)
-                h = conv(h, x_0, batch.adj_t.to(self.device))
-                x = h + x
-                x = x.relu()
-                xs.append(x[:batch.batch_size].cpu())
-                pbar.update(batch.batch_size)
-            x_all = torch.cat(xs, dim=0)
+        for conv in self.convs:
+            h = F.dropout(x, self.dropout, training=False)
+            h = conv(h, x_0, adj_t)
+            x = h + x
+            x = x.relu()
 
-        embedding_all = copy.copy(x_all)
+        _data_embedding = F.dropout(x, self.dropout, training=False)
 
-        xs = []
-        p_sim_list = []
-        for batch in subgraph_loader:
-            x = x_all[batch.n_id.to(x_all.device)].to(self.device)
-            embedding = embedding_all[batch.n_id.to(x_all.device)].to(self.device)[:batch.batch_size]
-            # print(embedding[:])
-            p_sim = self.m(self.generate_label_with_similar_nodes(embedding,
-                                                                  training_embedding,
-                                                                  training_y,
-                                                                  None))
-            p_sim_list.append(p_sim)
-            x = self.lins[1](x)
-            xs.append(x[:batch.batch_size].cpu())
-            pbar.update(batch.batch_size)
-        x_all = torch.cat(xs, dim=0)
-        p_sim_total = torch.cat(p_sim_list, dim=0)
+        lc_x = self.lins[1](_data_embedding)
+        p_lc = self.m(lc_x)
 
-        p_lc_total = self.m(x_all)
-        final_label_distribution = self.eta * p_lc_total.to(self.device) + (1 - self.eta) * p_sim_total
-        pbar.close()
+        p_sim = self.m(
+            self.generate_label_with_similar_nodes(_data_embedding,
+                                                   training_embedding,
+                                                   training_y,
+                                                   mask=None,
+                                                   neighbors_info=None))
+        final_label_distribution = self.eta * p_lc + (1 - self.eta) * p_sim
 
         return final_label_distribution
-
+    
 
 class NodeReprVAE(nn.Module):
 
@@ -1360,7 +1295,6 @@ class CacheGNN(nn.Module):
             hidden_dim1=hidden_dim,
             hidden_dim2=64,
             num_classes=num_classes,
-            normalize=True,
             delta=0.2,
             k=k,
             sigma=0.1,

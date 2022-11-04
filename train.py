@@ -19,6 +19,7 @@ from torch.nn import functional as F
 import torch_geometric.transforms as T
 from tqdm import tqdm
 import random
+import numpy as np
 
 random_seed = 1024
 torch.manual_seed(random_seed)
@@ -41,8 +42,7 @@ def train(run_time, args):
         train_dataset = PPI("./data/PPI", split='train')
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
         non_hop_adjacency_matrix_dict_path = os.path.join("./data/PPI/non_hop_2_adjacency_matrix_dict_val_batch_size_2.pkl")
-        train_node_id_dict_path = os.path.join("./data/PPI",
-                                               "train_node_id_dict.pkl")
+        train_node_id_dict_path = os.path.join("./data/PPI/train_node_id_dict.pkl")
 
     with open(non_hop_adjacency_matrix_dict_path, 'rb') as f:
         non_hop_adjacency_matrix_dict = pickle.load(f)
@@ -104,7 +104,8 @@ def train(run_time, args):
             train_info = model.get_training_embedding_cache(
                 batch,
                 id_dict=id_dict,
-                non_hop_2_adjacency_matrix_dict=non_hop_adjacency_matrix_dict
+                non_hop_2_adjacency_matrix_dict=non_hop_adjacency_matrix_dict,
+                neighbors_info=None
             )
             sim_info = model.get_sim_info(
                 train_info['train_embedding'],
@@ -184,6 +185,7 @@ def get_args():
                         help='softmax or sigmoid')
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--run_times', type=int, required=True)
+    parser.add_argument('--log_dir', type=str, required=True)
 
     return parser.parse_args()
 
